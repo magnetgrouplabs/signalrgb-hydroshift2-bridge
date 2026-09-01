@@ -555,15 +555,28 @@ var HS2_ROOT = {};
     // ---------------------------------------------------------------------------------
     // Bytes 4..7 of every frame. The firmware requires it to increase strictly, so the
     // source bumps by one whenever the clock has not moved: ts = raw > last ? raw : last + 1.
+    //
+    // CHANGED 2026-09-01: the origin is the Unix epoch, not this object's construction.
+    // Until the AIO was rebound to libusbK.sys only one process could hold it, and an
+    // origin of "whenever I started" was harmless. Now FanControl and SignalRGB write to
+    // the same OUT endpoint, and two counters both starting near zero interleave
+    // arbitrarily: whichever program launched second would hand the firmware timestamps
+    // far below the other's. Date.now() taken modulo 2^32 gives both writers the same
+    // origin, so their frames are ordered against each other by the wall clock. The C#
+    // side does the same thing in MonotonicTimestampSource; see docs/usb-sharing.md.
+    //
+    // The value wraps every 2^32 ms (about 49.7 days). That is a property of the
+    // protocol's 32 bit field, not of this choice of origin, and both writers wrap
+    // together because both count from the same place.
 
     function MonotonicTimestampSource() {
-        this._start = Date.now();
-        this._last = 0;
+        this._last = -1;
     }
 
     MonotonicTimestampSource.prototype.nextMs = function () {
-        var raw = (Date.now() - this._start) >>> 0;
-        var next = raw > this._last ? raw : this._last + 1;
+        var raw = Date.now() >>> 0;
+        var next = this._last < 0 ? raw
+            : (raw > this._last ? raw : (this._last + 1) >>> 0);
         this._last = next >>> 0;
         return this._last;
     };
@@ -1469,7 +1482,7 @@ const HS2 = HS2_ROOT.HS2
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.4"; }
+export function Version() { return "1.0.5"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -1558,6 +1571,7 @@ ringBrightness:readonly
 ringReverse:readonly
 ringOffset:readonly
 ringMode:readonly
+ringWaitForAck:readonly
 ringMinGapMs:readonly
 ringRefreshS:readonly
 ringBatchFrames:readonly
@@ -1583,7 +1597,7 @@ export function ControllableParameters() {
             step: "1",
             min: "1",
             max: "60",
-            default: "30"
+            default: "24"
         },
         {
             property: "screenRotation",
@@ -1688,6 +1702,14 @@ export function ControllableParameters() {
             type: "combobox",
             values: ["Single write", "Chunked 1016"],
             default: "Single write"
+        },
+        {
+            property: "ringWaitForAck",
+            group: "advanced",
+            label: "Ring: wait for each acknowledgement",
+            description: "Off: ring pushes are fire-and-forget so the screen never waits on them (default). On: each ring push waits about 50 ms for the block's acknowledgement, which guarantees it is processed at the cost of screen frame rate.",
+            type: "boolean",
+            default: "false"
         },
         {
             property: "readAcks",
@@ -1874,6 +1896,32 @@ const RING_STATIC_INTERVAL_MS = 20;
 let screenHoldUntil = 0;
 const SCREEN_HOLD_MS = 40;
 
+// Adaptive pacing. The block decodes each JPEG itself and cannot take every frame a 30 fps
+// canvas produces; pushing faster than it drains fills its buffer and the hold above then
+// drops frames in bursts, which looks like judder at a low rate. effectiveFps starts at the
+// configured target and backs off by 2 whenever an ack reports the buffer at or above the
+// low-water mark, then recovers by 1 after 60 clean acks, so it settles just under what the
+// block sustains. Never below MIN_ADAPTIVE_FPS.
+const MIN_ADAPTIVE_FPS = 8;
+let effectiveFps = 0;
+let cleanAcks = 0;
+
+function noteBufferLevel(level) {
+    if (level >= BUFFER_LEVEL_LOW_WATER) {
+        cleanAcks = 0;
+        effectiveFps = Math.max(MIN_ADAPTIVE_FPS, (effectiveFps || currentFps()) - 2);
+    } else if (++cleanAcks >= 60) {
+        cleanAcks = 0;
+        effectiveFps = Math.min(currentFps(), (effectiveFps || currentFps()) + 1);
+    }
+}
+
+function pacedFps() {
+    if (!effectiveFps || effectiveFps > currentFps()) effectiveFps = currentFps();
+
+    return effectiveFps;
+}
+
 function buildRingPositions() {
     const centre = (RING_GRID - 1) / 2;
     const positions = [];
@@ -1958,7 +2006,7 @@ function currentBrightness() {
 }
 
 function currentFps() {
-    return paramNumber(typeof targetFps !== "undefined" ? targetFps : undefined, 30, 1, 60);
+    return paramNumber(typeof targetFps !== "undefined" ? targetFps : undefined, 24, 1, 60);
 }
 
 function currentRotationStep() {
@@ -2184,12 +2232,16 @@ function readReply(tp, attempts, expectedOpcode) {
  */
 function waitForBufferSpace(tp, ack) {
     if (!tp || !ack || ack.length < 9) return;
-    if (HS2.readBufferLevel(ack) <= BUFFER_LEVEL_HIGH_WATER) return;
 
-    // Non-blocking: skip the next few frames and let the block drain.
+    const level = HS2.readBufferLevel(ack);
+
+    noteBufferLevel(level);
+
+    if (level <= BUFFER_LEVEL_HIGH_WATER) return;
+
+    // Non-blocking: skip the next frame or two and let the block drain.
     screenHoldUntil = Date.now() + SCREEN_HOLD_MS;
-}
-/**
+}/**
  * Writes one stream out, honouring the push mode. See BENCH QUESTION 1 at pushJpeg: the
  * single write is what the shipped sibling plugin does and is the default; the chunked mode
  * is the alternative to try if the panel refuses it.
@@ -2365,10 +2417,20 @@ function readRingFrame() {
  * One PushRgbData for the given frames, then its ack read - the same discipline the screen
  * uses. `frames` is an array of 72-byte arrays; one of them is the static case.
  */
+function currentRingWaitForAck() {
+    return paramBoolean(typeof ringWaitForAck !== "undefined" ? ringWaitForAck : undefined, false);
+}
+
 function pushRing(tp, frames, intervalMs) {
     if (!tp || !ringApiAvailable() || !frames || frames.length === 0) return false;
 
     writeStream(tp, HS2.ring.pushStream(timestamps, frames, intervalMs), FRAME_TIMEOUT_MS);
+
+    if (currentRingWaitForAck()) {
+        readReply(tp, 5, HS2.Opcode.PushRgbData);
+
+        return true;
+    }
 
     // Fire and forget. The block takes about 50 ms to acknowledge a ring push; waiting for it
     // here stalled every screen frame in between. The ack is consumed and discarded by the
@@ -2678,7 +2740,7 @@ export function Render() {
 
     // Frame pacing. SignalRGB drives Render as fast as the frame rate target allows, which
     // is far more often than a 480x480 JPEG needs to be re-encoded and pushed.
-    const interval = Math.max(1, Math.floor(1000 / currentFps()) - FRAME_INTERVAL_SLACK_MS);
+    const interval = Math.max(1, Math.floor(1000 / pacedFps()) - FRAME_INTERVAL_SLACK_MS);
 
     if (now - lastFramePushedAt < interval) {
         pause(1);
