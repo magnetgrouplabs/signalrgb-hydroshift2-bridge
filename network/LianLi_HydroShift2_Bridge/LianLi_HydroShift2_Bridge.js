@@ -50,7 +50,7 @@ const RING_POSITIONS = buildRingPositions();
 const RING_NAMES = RING_POSITIONS.map(function(_, i) { return "Ring " + (i + 1); });
 
 export function Name() { return "Lian Li HydroShift II Bridge"; }
-export function Version() { return "0.3.1"; }
+export function Version() { return "0.3.2"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Magnet Group Labs"; }
 export function Size() { return [RING_GRID, RING_GRID]; }
@@ -240,12 +240,46 @@ let lastRingColours = null;
 let ringBlanked = false;
 let ringUnavailableLogged = false;
 
+// Diagnostics mirror. SignalRGB keeps device.log() output in an in-app console that no
+// file ever sees, so every line is also sent as plain text to 127.0.0.1:DIAG_PORT where a
+// local listener can record it. Nothing listens there in normal use and UDP does not care.
+const DIAG_PORT = 48213;
+const diag = { renders: 0, screenAttempts: 0, grabbed: 0, grabNull: 0, badJpeg: 0, framesSent: 0, chunksSent: 0, exceptions: 0, ringSent: 0 };
+let lastDiagAt = 0;
+
+function textBytes(text) {
+	const out = [];
+
+	for (let i = 0; i < text.length && out.length < 1400; i++) {
+		const c = text.charCodeAt(i);
+
+		out.push(c >= 32 && c < 127 ? c : 63);
+	}
+
+	return out;
+}
+
+function mirror(text) {
+	if (!socket) { return; }
+
+	try { socket.write(textBytes(text), BRIDGE_HOST, DIAG_PORT); } catch (e) { /* diagnostics never break the plugin */ }
+}
+
 function log(message) {
 	if (typeof device !== "undefined" && device && typeof device.log === "function") {
 		device.log(message);
 	} else if (typeof service !== "undefined" && service && typeof service.log === "function") {
 		service.log(message);
 	}
+
+	mirror("HS2LOG " + message);
+}
+
+function sendDiag(now) {
+	if (now - lastDiagAt < 5000) { return; }
+
+	lastDiagAt = now;
+	mirror("HS2DIAG v" + Version() + " " + JSON.stringify(diag));
 }
 
 function currentPort() {
@@ -511,6 +545,36 @@ function normalizeFrame(frame) {
 	return out;
 }
 
+function hex(bytes, from, to) {
+	let out = "";
+
+	for (let i = from; i < to && i < bytes.length; i++) {
+		const v = (bytes[i] & 0xFF).toString(16);
+
+		out += (v.length < 2 ? "0" : "") + v + " ";
+	}
+
+	return out.trim();
+}
+
+function describeRaw(raw) {
+	let text = describeShape(raw) + " typeof=" + typeof raw;
+
+	try {
+		if (raw && raw.constructor && raw.constructor.name) { text += " ctor=" + raw.constructor.name; }
+		if (raw && typeof raw === "object" && typeof raw.length !== "number") {
+			text += " keys=" + Object.keys(raw).slice(0, 12).join(",");
+		}
+		if (typeof raw === "string") { text += " str=" + raw.slice(0, 40); }
+		const view = normalizeFrame(raw);
+		if (view && view.length) { text += " head=" + hex(view, 0, 4) + " tail=" + hex(view, view.length - 4, view.length); }
+	} catch (e) { text += " describe failed: " + e; }
+
+	return text;
+}
+
+let lastShapeLogAt = 0;
+
 function getFrameFromModule(module, quality) {
 	if (!qualityOptionRejected) {
 		try {
@@ -521,7 +585,14 @@ function getFrameFromModule(module, quality) {
 		}
 	}
 
-	return module.getFrame({ format: "JPEG" });
+	try {
+		return module.getFrame({ format: "JPEG" });
+	} catch (e) {
+		diag.exceptions++;
+		log("LCD.getFrame threw: " + e);
+
+		return null;
+	}
 }
 
 function grabFrame() {
@@ -541,14 +612,18 @@ function grabFrame() {
 	for (let i = 0; i < QUALITY_LADDER.length; i++) {
 		const raw = getFrameFromModule(module, QUALITY_LADDER[i]);
 
-		if (!frameShapeLogged) {
+		const nowMs = Date.now();
+
+		if (!frameShapeLogged || nowMs - lastShapeLogAt > 10000) {
 			frameShapeLogged = true;
-			log("LCD.getFrame returned " + describeShape(raw));
+			lastShapeLogAt = nowMs;
+			log("LCD.getFrame returned " + describeRaw(raw));
 		}
 
 		const frame = normalizeFrame(raw);
 
-		if (!frame || frame.length === 0) { return null; }
+		if (!frame || frame.length === 0) { diag.grabNull++; return null; }
+		diag.grabbed++;
 		if (frame.length <= MAX_FRAME_BYTES) { return frame; }
 		if (qualityOptionRejected) { return null; } // no quality knob left to turn
 	}
@@ -601,6 +676,18 @@ export function Render() {
 
 	const now = Date.now();
 
+	diag.renders++;
+	sendDiag(now);
+
+	try {
+		renderTick(now);
+	} catch (e) {
+		diag.exceptions++;
+		log("Render threw: " + e);
+	}
+}
+
+function renderTick(now) {
 	if (currentBrightness() !== sentBrightness) {
 		sendHeartbeat(now, true);
 	}
@@ -616,6 +703,7 @@ export function Render() {
 	}
 
 	lastFrameAt = now;
+	diag.screenAttempts++;
 
 	const frame = grabFrame();
 
@@ -636,7 +724,8 @@ export function Render() {
 	const datagrams = buildFrameDatagrams(frame, frameId);
 
 	if (!datagrams) {
-		log("Dropped frame " + frameId + ": not a well formed JPEG.");
+		diag.badJpeg++;
+		log("Dropped frame " + frameId + ": not a well formed JPEG (" + frame.length + " bytes, head " + hex(frame, 0, 4) + ", tail " + hex(frame, frame.length - 4, frame.length) + ").");
 
 		return;
 	}
@@ -644,6 +733,9 @@ export function Render() {
 	for (let i = 0; i < datagrams.length; i++) {
 		sendDatagram(datagrams[i], now);
 	}
+
+	diag.framesSent++;
+	diag.chunksSent += datagrams.length;
 }
 
 export function Shutdown(suspend) {
