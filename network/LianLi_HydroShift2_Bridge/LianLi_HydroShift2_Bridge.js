@@ -1,5 +1,7 @@
 import udp from "@SignalRGB/udp";
-import LCD from "@SignalRGB/lcd";
+
+// @SignalRGB/lcd is deliberately NOT imported here. See lcdModule() below: a
+// static import of it stops this plugin from ever producing a device.
 
 // ---------------------------------------------------------------------------
 // The block's RGB ring.
@@ -43,7 +45,6 @@ export function Name() { return "Lian Li HydroShift II Bridge"; }
 export function Version() { return "0.2.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Magnet Group Labs"; }
-export function Documentation() { return ""; }
 export function Size() { return [RING_GRID, RING_GRID]; }
 export function DefaultPosition() { return [240, 120]; }
 export function DefaultScale() { return 1.0; }
@@ -106,6 +107,7 @@ const QUALITY_LADDER = [80, 60, 40];
 const BRIDGE_HOST = "127.0.0.1";
 const DEFAULT_PORT = 48211;
 const CONTROLLER_ID = "hydroshift2-bridge-localhost";
+const CONTROLLER_NAME = "HydroShift II Screen Bridge";
 
 // Send address for the discovery service's inert socket. Never the bridge port:
 // see the comment on DiscoveryService below.
@@ -376,9 +378,91 @@ function renderRing(now) {
 	sendRingColours(colours, now);
 }
 
+// ---------------------------------------------------------------------------
+// @SignalRGB/lcd, resolved lazily.
+//
+// This one file is evaluated in two different JavaScript engines. The device
+// engine (Signal\Products\ThirdParty\Plugin\ThirdpartyJsPlugin.cpp) registers
+// bus, hid, lcd, udp and the rest. The discovery engine
+// (Signal\Discovery\DiscoveryService.cpp) registers a much smaller set -
+// DeviceDiscovery ("service"), appInfo, permissions, tcp, udp, performance,
+// base64 - and there is no lcd module in it.
+//
+// A static `import LCD from "@SignalRGB/lcd"` therefore fails to resolve when
+// the discovery thread instantiates the module, the whole module errors out
+// before DiscoveryService() can be read, and the plugin registers as a network
+// service that never ticks, never announces a controller and never produces a
+// device. That is exactly what happened on 2026-09-01: the log shows "Starting
+// discovery thread for ...LianLi_HydroShift2_Bridge.js" and then nothing. Every
+// shipped network plugin imports only modules the discovery engine also has
+// (WLED and Yeelight import @SignalRGB/udp, Twinkly @SignalRGB/base64,
+// Cololight/LeetDesk/SRGBmods-WLC nothing); @SignalRGB/lcd is imported only by
+// USB plugins such as NZXT_Kraken_Elite.js.
+//
+// So the module is fetched at runtime, on the device side only, and every
+// failure is swallowed: the ring, the heartbeat and the discovery service must
+// all keep working on an engine that has no LCD at all.
+let lcd = null;
+let lcdRequested = false;
+let lcdMissingLogged = false;
+
+function lcdModule() {
+	if (lcd) { return lcd; }
+
+	// A host that hands the module over as a global needs nothing else. This is
+	// also the seam the offline suite drives.
+	if (typeof LCD !== "undefined" && LCD && typeof LCD.getFrame === "function") {
+		lcd = LCD;
+
+		return lcd;
+	}
+
+	if (!lcdRequested) {
+		lcdRequested = true;
+
+		try {
+			// Not awaited: Initialize() and Render() both cope with a null lcd,
+			// and the first frame simply waits for the promise to land.
+			import("@SignalRGB/lcd").then(function(module) {
+				lcd = (module && module.default) ? module.default : module;
+				initializeLcd();
+			}).catch(function(err) {
+				log("Could not load @SignalRGB/lcd: " + err + ". The screen stays dark; the ring is unaffected.");
+			});
+		} catch (err) {
+			log("Could not load @SignalRGB/lcd: " + err + ". The screen stays dark; the ring is unaffected.");
+		}
+	}
+
+	return null;
+}
+
+function initializeLcd() {
+	const module = lcdModule();
+
+	if (!module) { return false; }
+
+	module.initialize({ width: SCREEN_WIDTH, height: SCREEN_HEIGHT });
+
+	return true;
+}
+
 function grabFrame() {
+	const module = lcdModule();
+
+	if (!module) {
+		if (!lcdMissingLogged) {
+			log("@SignalRGB/lcd is not available yet; no screen frames are being sent.");
+			lcdMissingLogged = true;
+		}
+
+		return null;
+	}
+
+	lcdMissingLogged = false;
+
 	for (let i = 0; i < QUALITY_LADDER.length; i++) {
-		const frame = LCD.getFrame({ format: "JPEG", quality: QUALITY_LADDER[i] });
+		const frame = module.getFrame({ format: "JPEG", quality: QUALITY_LADDER[i] });
 
 		if (!frame || frame.length === 0) { return null; }
 		if (frame.length <= MAX_FRAME_BYTES) { return frame; }
@@ -402,7 +486,8 @@ export function Initialize() {
 		device.setControllableLeds(RING_NAMES.slice(), RING_POSITIONS.map(function(p) { return p.slice(); }));
 	}
 
-	LCD.initialize({ width: SCREEN_WIDTH, height: SCREEN_HEIGHT });
+	lcdMissingLogged = false;
+	initializeLcd();
 
 	socket = udp.createSocket();
 	frameId = 0;
@@ -540,20 +625,53 @@ export function ImageUrl() {
 // service exists purely to announce one fixed loopback controller.
 // ---------------------------------------------------------------------------
 
+// A fabricated discovery reply. Every shipped network plugin builds its
+// controller out of the `value` SignalRGB hands to DiscoveryService.Discovered()
+// - Cololight.js, Govee.js and Nanoleaf.js all take {id, ip, port, response} -
+// so the loopback endpoint is expressed in exactly that shape and pushed through
+// exactly that path. Nothing here comes off the wire; the endpoint is fixed.
+function loopbackDiscoveryValue() {
+	return {
+		id: CONTROLLER_ID,
+		name: CONTROLLER_NAME,
+		ip: BRIDGE_HOST,
+		port: DEFAULT_PORT,
+		response: { source: "loopback", host: BRIDGE_HOST, port: DEFAULT_PORT },
+	};
+}
+
 class HydroShift2BridgeController {
-	constructor() {
-		this.id = CONTROLLER_ID;
-		this.name = "HydroShift II Screen Bridge";
-		this.ip = BRIDGE_HOST;
-		this.port = DEFAULT_PORT;
-		this.announced = false;
+	constructor(value) {
+		this.initialized = false;
+		this.updateWithValue(value, false);
+
+		service.log("Constructed: " + this.name);
 	}
 
-	update() {
-		if (this.announced) { return; }
+	// Shipped controllers all expose updateWithValue(value) and notify the UI
+	// through service.updateController(this); SignalRGB calls it when a device is
+	// rediscovered, and the settings pane reads the properties back off it.
+	updateWithValue(value, notify) {
+		const source = value || loopbackDiscoveryValue();
 
+		this.id = source.id;
+		this.name = source.name || CONTROLLER_NAME;
+		this.ip = source.ip;
+		this.port = source.port;
+		this.response = source.response;
+
+		if (notify !== false) { service.updateController(this); }
+	}
+
+	// Called once per discovery tick off service.controllers, the way Govee.js
+	// drives its controllers. announceController is what actually creates the
+	// device, so it is guarded to fire exactly once.
+	update() {
+		if (this.initialized) { return; }
+
+		this.initialized = true;
+		service.updateController(this);
 		service.announceController(this);
-		this.announced = true;
 		service.log("Announced the local HydroShift II screen bridge.");
 	}
 }
@@ -561,33 +679,33 @@ class HydroShift2BridgeController {
 export function DiscoveryService() {
 	this.IconUrl = "https://assets.signalrgb.com/devices/brands/lian-li/coolers/galahad-ii-lcd.png";
 
-	// SignalRGB's discovery thread only spins up (and only then starts calling
-	// Update()) once the service declares a transport. The engine reads exactly
-	// these properties off this object - MDns, Hosts, UdpBroadcastAddress,
-	// UdpBroadcastPort, UdpListenPort - and every shipped network plugin
-	// (WLED, Cololight, Twinkly, Yeelight, Govee, Nanoleaf, PhilipsHue,
-	// LeetDesk, SRGBmods-WLC) sets one of them. Without any of them the service
-	// is registered but never ticked, which is exactly what happened on the
-	// 2026-09-01 restart: the crawler counted the plugin and started a discovery
-	// thread, then nothing.
+	// SignalRGB's discovery thread reads exactly these properties off this object
+	// - MDns, Hosts, UdpBroadcastAddress, UdpBroadcastPort, UdpListenPort - and
+	// every shipped network plugin (WLED, Cololight, Twinkly, Yeelight, Govee,
+	// Nanoleaf, PhilipsHue, LeetDesk, SRGBmods-WLC) sets one of them.
 	//
 	// Nothing is actually discovered here - the endpoint is fixed at loopback -
 	// so the socket is deliberately inert: the send address points at a port
 	// nothing listens on (NOT the bridge port, so the bridge never sees junk),
 	// and UdpListenPort 0 lets the OS pick an ephemeral port so we can never
 	// collide with the bridge's own bind. Yeelight uses UdpListenPort 0 the
-	// same way.
+	// same way. service.broadcast() is never called, so nothing is ever sent.
 	this.UdpBroadcastAddress = BRIDGE_HOST;
 	this.UdpBroadcastPort = DISCOVERY_SINK_PORT;
 	this.UdpListenPort = 0;
+
+	this.announcedLoopback = false;
 
 	this.Initialize = function() {
 		service.log("HydroShift II bridge service starting. Nothing is scanned; the endpoint is always " + BRIDGE_HOST + ".");
 	};
 
 	this.Update = function() {
-		if (!service.hasController(CONTROLLER_ID)) {
-			service.addController(new HydroShift2BridgeController());
+		// First tick: hand ourselves the discovery reply the network would have
+		// produced if there were anything out there to answer.
+		if (!this.announcedLoopback) {
+			this.announcedLoopback = true;
+			this.Discovered(loopbackDiscoveryValue());
 		}
 
 		for (const cont of service.controllers) {
@@ -595,11 +713,30 @@ export function DiscoveryService() {
 		}
 	};
 
-	this.Discovered = function() {
-		// No mDNS, no broadcast. Nothing ever arrives here.
+	// The one path that creates a device, shaped exactly like Cololight.js:
+	// getController -> addController -> updateController -> announceController on
+	// a first sighting, updateWithValue on a repeat.
+	this.Discovered = function(value) {
+		if (!value || !value.id) { return; }
+
+		const existing = service.getController(value.id);
+
+		if (existing === undefined || existing === null) {
+			const cont = new HydroShift2BridgeController(value);
+
+			service.addController(cont);
+			service.updateController(cont);
+			service.announceController(cont);
+			cont.initialized = true;
+			service.log("Announced the local HydroShift II screen bridge.");
+		} else {
+			existing.updateWithValue(value);
+		}
 	};
 
 	this.forceDiscover = function() {
-		// Nothing to force: the endpoint is fixed at 127.0.0.1.
+		// Nothing to force: the endpoint is fixed at 127.0.0.1. Re-run the
+		// loopback announce so a manual "add device" still lands.
+		this.Discovered(loopbackDiscoveryValue());
 	};
 }
