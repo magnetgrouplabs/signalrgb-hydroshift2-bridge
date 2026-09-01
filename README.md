@@ -1,22 +1,44 @@
-# Lian Li HydroShift II LCD-S 360 for SignalRGB
+# Lian Li HydroShift II Bridge for SignalRGB
 
-A SignalRGB device plugin for the Lian Li HydroShift II LCD-S 360 AIO (USB `1CBE:A034`). It gives
-the block SignalRGB's native LCD experience (picture and GIF picker, LCD faces, brightness, zoom,
-blur) on the 480 x 480 panel, and exposes the 24-LED RGB ring around the block as a lit `Ring`
-subdevice so effects and sync run on it like on any other device.
+A SignalRGB add-on for the Lian Li HydroShift II LCD-S 360 AIO. It gives the block SignalRGB's
+native LCD experience (picture and GIF picker, LCD faces, brightness) on the 480 x 480 panel and
+exposes the 24-LED ring as a lit device, while a FanControl plugin keeps sole ownership of the
+AIO's USB handle for pump control. SignalRGB renders; FanControl writes to the hardware.
 
-Cooling is deliberately out of scope for this plugin. It never sends a pump speed and never reads
-the coolant sensor; those belong to a fan-control program. See "Coexisting with FanControl" below.
+Cooling is deliberately out of scope here. This plugin never sends a pump speed and never reads
+the coolant sensor.
 
 ## Layout
 
 ```
-usb/
-  LianLi_HydroShift2_LCD.js    the plugin (Type "rawusb", VID 0x1CBE, PID 0xA034)
+network/
+  LianLi_HydroShift2_Bridge/
+    LianLi_HydroShift2_Bridge.js   the plugin (Type "network"), version 0.4.0
+    LianLi_HydroShift2_Bridge.qml  its settings pane in the Add-ons page
+    @SignalRGB/lcd                 link-time stand-in for SignalRGB's lcd module (see below)
 ```
 
-SignalRGB scans the whole cloned repository and registers the plugin by the vendor and product id
-it declares, so the folder name is convention only. There is no manifest file.
+SignalRGB scans the whole cloned repository, so the folder names are convention only. There is
+no manifest file.
+
+## How it works (0.4.0)
+
+The plugin is a network-type device that never opens the AIO's USB handle. It imports
+SignalRGB's lcd module, so the device gets the native LCD tab, grabs the 480 x 480 canvas as a
+JPEG on every screen tick, cuts it into 2000-byte chunks behind an 18-byte header and sends them
+over UDP to 127.0.0.1:48211, where the FanControl plugin that owns the USB handle reassembles the
+frame and pushes it to the panel. The 24-LED ring rides the same socket as 72-byte colour
+datagrams. Chunks are 2000 bytes because SignalRGB's udp module refuses larger datagrams
+(measured: 2066 bytes sent, 4114 refused).
+
+The stub at `@SignalRGB/lcd` exists because SignalRGB loads the same file in two JavaScript
+engines. The device engine registers the real lcd module natively and the import binds to it. The
+discovery engine has no lcd module, so the same import resolves to the stub next to the plugin,
+the link succeeds and the discovery service runs. The stub marks itself with isShim and is never
+used for frames.
+
+Diagnostics: every log line and a five second counters summary are also sent as plain text to UDP
+127.0.0.1:48213, where a local listener can record them; nothing listens there in normal use.
 
 ## Install
 
@@ -35,44 +57,28 @@ to `main` arrive on the next full restart of SignalRGB. No click in the Add-ons 
 ## Requirements
 
 - SignalRGB 2.5.74 or later.
-- The AIO's internal USB cable connected (the USB path is the only control path).
-- Nothing else holding the AIO's USB handle. The device is single-owner: L-Connect 3 must not be
-  running, and a FanControl plugin that owns this device must be disabled while this plugin is in
-  use (see below).
-
-## Coexisting with FanControl
-
-The block exposes one USB interface and Windows binds it to WinUSB, which allows one open handle at
-a time. Until a sharing mechanism is in place, either SignalRGB (this plugin: LCD and ring) or a
-fan-control plugin (pump curve) can hold the device, not both. With no host controlling the pump,
-the block runs its own default of roughly 3100 RPM, which is its full speed and is safe.
+- The FanControl.HydroShift2 plugin running (it owns the USB device and listens on
+  127.0.0.1:48211). Without it the device still appears in SignalRGB but nothing reaches the panel.
 
 ## Parameters
 
-| Group | Parameter | Default | Notes |
-| --- | --- | --- | --- |
-| screen | Brightness | 80 | Panel backlight, 0 to 100 |
-| screen | Frames per second | 30 | 1 to 60 |
-| screen | Rotation | 0 | 0, 90, 180, 270 |
-| lighting | Ring Lighting | on | Off sends one black frame and then nothing |
-| lighting | Ring Brightness | 100 | Scaled on the host; the block has no ring brightness command |
-| lighting | Reverse Ring Direction | off | Flips the index order, LED 1 stays in place |
-| lighting | Ring Offset | 0 | Rotates which physical LED is index 0 (0 to 23) |
-| lighting | Ring Mode | Static | Static: one frame per colour change, rate limited. Batch: multi-frame upload the block plays by itself |
-| lighting | Ring Min Gap (ms) | 500 | Static mode rate limit |
-| lighting | Ring Refresh (s) | 0 | Static mode periodic re-push, 0 is off |
-| lighting | Ring Batch Frames | 24 | Batch mode frames per upload |
-| lighting | Ring Sample (ms) | 100 | Batch mode sampling interval and playback interval |
-| advanced | Frame push mode | Single write | Chunked 1016 is a fallback for comparison |
-| advanced | Read acknowledgements | on | Off makes every write fire-and-forget |
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| Bridge UDP Port | 48211 | Where the FanControl plugin listens |
+| Stream Screen | on | |
+| Screen Frames Per Second | 15 | 1 to 30; the ring is serviced at 30 Hz regardless |
+| Screen Brightness | 100 | Sent to the receiver, which owns the panel's brightness command |
+| Ring Lighting | on | Off sends one black frame and then nothing |
+| Ring Brightness | 100 | Scaled on the host; the block has no ring brightness command |
+| Reverse Ring Direction | off | Flips the index order, LED 1 stays in place |
 
 ## Status
 
-- LCD path: protocol verified on hardware (single bulk write, ack, panel holds the last frame).
-- Ring: a solid colour push is verified on hardware. Fast single-frame streaming is ignored by the
-  block, which is why Static mode is rate limited. Batch mode (the block looping an uploaded
-  animation) is implemented from the reference driver and not yet verified on hardware. Which
-  physical LED is index 0 and which way the indices run is not yet known; use Reverse and Offset.
+- 0.2.1 (2026-09-01 17:00): device appeared, no LCD tab, no screen frames ever left SignalRGB.
+- 0.3.0: static lcd import plus the shim file; the LCD tab appeared.
+- 0.3.1 to 0.3.3: frame normalisation, 30 Hz render tick, diagnostics mirror, size probes.
+- 0.4.0: 2000-byte chunks after the size probes showed the udp module refusing 4 KB and above.
+  Requires the FanControl.HydroShift2 receiver build that accepts variable chunk lengths.
 
 ## Uninstall
 
