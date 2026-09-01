@@ -50,7 +50,7 @@ const RING_POSITIONS = buildRingPositions();
 const RING_NAMES = RING_POSITIONS.map(function(_, i) { return "Ring " + (i + 1); });
 
 export function Name() { return "Lian Li HydroShift II Bridge"; }
-export function Version() { return "0.3.3"; }
+export function Version() { return "0.4.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Magnet Group Labs"; }
 export function Size() { return [RING_GRID, RING_GRID]; }
@@ -88,7 +88,14 @@ export function ControllableParameters() {
 const MAGIC = [0x48, 0x53, 0x32, 0x42]; // "HS2B"
 const PROTOCOL_VERSION = 1;
 const HEADER_BYTES = 18;
-const MAX_PAYLOAD_BYTES = 8192;
+// 2000, not 8192. Measured on 2026-09-01 with the size probes below: SignalRGB's udp
+// socket.write transmits datagrams of 90, 1018, 1418 and 2066 bytes and returns -1 for
+// 4114, 8210 and 16402 bytes. Every 8210-byte chunk the bridge sent before 0.4.0 was
+// therefore refused at the sender, which is why the panel never showed a SignalRGB
+// frame. 2000 + 18 = 2018 bytes sits inside the proven range. The receiver learns the
+// chunk length from the frame itself (docsridge-protocol.md), so this is the one place
+// the value lives.
+const MAX_PAYLOAD_BYTES = 2000;
 const MAX_FRAME_BYTES = 153600;
 const MAX_DATAGRAM_BYTES = HEADER_BYTES + MAX_PAYLOAD_BYTES;
 
