@@ -1,4 +1,5 @@
 import LCD from "@SignalRGB/lcd";
+import udp from "@SignalRGB/udp";
 
 // LianLi_HydroShift2_LCD.js
 //
@@ -1460,7 +1461,7 @@ const HS2 = (typeof globalThis !== "undefined" && globalThis.HS2)
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.0"; }
+export function Version() { return "1.0.1"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -2010,10 +2011,43 @@ function sameBytes(a, b) {
     return true;
 }
 
+// Diagnostics mirror: SignalRGB keeps device.log() output in an in-app console that no file
+// ever sees, so every line is also sent as plain text to 127.0.0.1:DIAG_PORT where a local
+// listener can record it. Nothing listens there in normal use and UDP does not care.
+const DIAG_PORT = 48213;
+let diagSocket = null;
+
+function mirror(text) {
+    try {
+        if (typeof udp === "undefined" || !udp) return;
+        if (!diagSocket) diagSocket = udp.createSocket();
+        const out = [];
+        for (let i = 0; i < text.length && out.length < 1400; i++) {
+            const c = text.charCodeAt(i);
+            out.push(c >= 32 && c < 127 ? c : 63);
+        }
+        diagSocket.write(out, "127.0.0.1", DIAG_PORT);
+    } catch (e) { /* diagnostics never break the plugin */ }
+}
+
 function log(message) {
     if (typeof device !== "undefined" && device && typeof device.log === "function") {
         device.log("HydroShift II: " + message);
     }
+    mirror("HS2LCD " + message);
+}
+
+// Runs one Initialize step, naming it before and naming it again if it throws, so a bare
+// "TypeError: Type error" from a native call (all SignalRGB's log shows) can be placed.
+function step(name, action) {
+    mirror("HS2LCD init: " + name);
+    try {
+        return action();
+    } catch (e) {
+        log("init FAILED at " + name + ": " + e);
+        throw e;
+    }
+}
 }
 
 function pause(ms) {
@@ -2504,45 +2538,53 @@ export function Initialize() {
     // is deliberately the panel's exact resolution. No `circular: true` either: the LCD-S is
     // the square-screen model (h2_aio.rs:72 sets is_square for PID 0xA034), and the round
     // Corsair_XC7_LCD.js is the only shipped plugin that passes that flag.
-    LCD.initialize({ width: HS2.PanelInfo.Width, height: HS2.PanelInfo.Height });
+    step("LCD.initialize", function () {
+        LCD.initialize({ width: HS2.PanelInfo.Width, height: HS2.PanelInfo.Height });
+    });
 
-    transport = createUsbTransport(device);
+    transport = step("createUsbTransport", function () { return createUsbTransport(device); });
 
     // Anything the previous owner of this handle left queued on the IN endpoint is not an
     // answer to us. Throw it away before the first command so the acks line up.
-    const stale = transport.drain();
+    const stale = step("drain", function () { return transport.drain(); });
 
     if (stale > 0) log("discarded " + stale + " stale reply/replies left on the endpoint.");
 
     // Wake preamble: StopPlay, StopClock, GetVer, each its own write and read, 150 ms apart.
     // After the LCD has been in play mode the block ignores control commands until this
     // re-arms the channel (PUMP-CONTROL.md section 3 / Commands.WakePreamble).
-    sendCommand(transport, HS2.commands.stopPlay(timestamps));
-    pause(150);
-    sendCommand(transport, HS2.commands.stopClock(timestamps));
-    pause(150);
-    sendCommand(transport, HS2.commands.getVer(timestamps));
-    pause(150);
+    step("wake preamble", function () {
+        sendCommand(transport, HS2.commands.stopPlay(timestamps));
+        pause(150);
+        sendCommand(transport, HS2.commands.stopClock(timestamps));
+        pause(150);
+        sendCommand(transport, HS2.commands.getVer(timestamps));
+        pause(150);
+    });
 
     // Screen init (PUMP-CONTROL.md section 7): panel frame rate, clock, then stop the clock
     // so it does not draw over the pushed frames.
-    sendCommand(transport, HS2.commands.frameRate(timestamps, PANEL_FRAME_RATE));
-    sendCommand(transport, HS2.commands.syncClock(timestamps, new Date(), CLOCK_MODE));
-    sendCommand(transport, HS2.commands.stopClock(timestamps));
+    step("screen init", function () {
+        sendCommand(transport, HS2.commands.frameRate(timestamps, PANEL_FRAME_RATE));
+        sendCommand(transport, HS2.commands.syncClock(timestamps, new Date(), CLOCK_MODE));
+        sendCommand(transport, HS2.commands.stopClock(timestamps));
+    });
 
-    applyBrightness(transport, true);
-    applyRotation(transport, true);
+    step("brightness", function () { applyBrightness(transport, true); });
+    step("rotation", function () { applyRotation(transport, true); });
 
     // Clear both layers: drop the PNG overlay, then paint the background black so whatever
     // the offline preset left on screen is gone before the first real frame.
-    sendCommand(transport, HS2.commands.clearPng(timestamps));
-    pushBlackFrame(transport);
+    step("clear layers", function () {
+        sendCommand(transport, HS2.commands.clearPng(timestamps));
+        pushBlackFrame(transport);
+    });
 
-    initRing();
+    step("ring subdevice", function () { initRing(); });
 
     // Ask SignalRGB to call Render at roughly the configured rate. The manual clock in
     // Render() is still there because this is a target, not a guarantee.
-    device.setFrameRateTarget(currentFps());
+    step("setFrameRateTarget", function () { device.setFrameRateTarget(currentFps()); });
 
     initialised = true;
     log("LCD-S 360 initialised at " + HS2.PanelInfo.Width + "x" + HS2.PanelInfo.Height + ", "
