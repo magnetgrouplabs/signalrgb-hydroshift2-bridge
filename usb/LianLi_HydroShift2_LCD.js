@@ -1482,7 +1482,7 @@ const HS2 = HS2_ROOT.HS2
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.5"; }
+export function Version() { return "1.0.6"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -1597,7 +1597,7 @@ export function ControllableParameters() {
             step: "1",
             min: "1",
             max: "60",
-            default: "24"
+            default: "30"
         },
         {
             property: "screenRotation",
@@ -1759,7 +1759,6 @@ const CHUNK_SIZE = 1016;
  * throttle: a tick that lands a millisecond early is rejected and the frame waits a whole
  * extra tick, halving the real rate. The slack turns the gate into a floor.
  */
-const FRAME_INTERVAL_SLACK_MS = 4;
 
 /**
  * A real 480x480 all-black baseline JPEG (4:2:0, quality 25, 4226 bytes). Pushed to clear
@@ -1890,37 +1889,6 @@ const RING_FRAME_BYTES = RING_LED_COUNT * 3;   // 72
 // while it is still holding the previous frame for its declared interval.
 const RING_STATIC_INTERVAL_MS = 20;
 
-// Screen back-pressure without blocking: when a push ack reports the block's frame buffer
-// above the high-water mark, frames are skipped until this time instead of polling
-// QueryBlock in 50 ms steps inside Render (which froze both the screen and the ring).
-let screenHoldUntil = 0;
-const SCREEN_HOLD_MS = 40;
-
-// Adaptive pacing. The block decodes each JPEG itself and cannot take every frame a 30 fps
-// canvas produces; pushing faster than it drains fills its buffer and the hold above then
-// drops frames in bursts, which looks like judder at a low rate. effectiveFps starts at the
-// configured target and backs off by 2 whenever an ack reports the buffer at or above the
-// low-water mark, then recovers by 1 after 60 clean acks, so it settles just under what the
-// block sustains. Never below MIN_ADAPTIVE_FPS.
-const MIN_ADAPTIVE_FPS = 8;
-let effectiveFps = 0;
-let cleanAcks = 0;
-
-function noteBufferLevel(level) {
-    if (level >= BUFFER_LEVEL_LOW_WATER) {
-        cleanAcks = 0;
-        effectiveFps = Math.max(MIN_ADAPTIVE_FPS, (effectiveFps || currentFps()) - 2);
-    } else if (++cleanAcks >= 60) {
-        cleanAcks = 0;
-        effectiveFps = Math.min(currentFps(), (effectiveFps || currentFps()) + 1);
-    }
-}
-
-function pacedFps() {
-    if (!effectiveFps || effectiveFps > currentFps()) effectiveFps = currentFps();
-
-    return effectiveFps;
-}
 
 function buildRingPositions() {
     const centre = (RING_GRID - 1) / 2;
@@ -2006,7 +1974,7 @@ function currentBrightness() {
 }
 
 function currentFps() {
-    return paramNumber(typeof targetFps !== "undefined" ? targetFps : undefined, 24, 1, 60);
+    return paramNumber(typeof targetFps !== "undefined" ? targetFps : undefined, 30, 1, 60);
 }
 
 function currentRotationStep() {
@@ -2230,22 +2198,8 @@ function readReply(tp, attempts, expectedOpcode) {
  * Back-pressure. PUMP-CONTROL.md section 7: if ack byte 8 is above 3, poll QueryBlock every
  * 50 ms until the block's frame buffer level falls to 2 or less.
  */
-function waitForBufferSpace(tp, ack) {
-    if (!tp || !ack || ack.length < 9) return;
 
-    const level = HS2.readBufferLevel(ack);
-
-    noteBufferLevel(level);
-
-    if (level <= BUFFER_LEVEL_HIGH_WATER) return;
-
-    // Non-blocking: skip the next frame or two and let the block drain.
-    screenHoldUntil = Date.now() + SCREEN_HOLD_MS;
-}/**
- * Writes one stream out, honouring the push mode. See BENCH QUESTION 1 at pushJpeg: the
- * single write is what the shipped sibling plugin does and is the default; the chunked mode
- * is the alternative to try if the panel refuses it.
- */
+/** Writes one already-built stream, whole or in 1016-byte chunks per the pushMode setting. */
 function writeStream(tp, stream, timeoutMs) {
     if (currentPushMode() === "Chunked 1016" && stream.length > CHUNK_SIZE) {
         const chunks = HS2.chunkStream(stream, CHUNK_SIZE);
@@ -2332,9 +2286,12 @@ function pushJpeg(tp, jpegBytes) {
     }
 
     writeStream(tp, HS2.buildJpgPushStream(timestamps, jpegBytes), FRAME_TIMEOUT_MS);
-    waitForBufferSpace(tp, readReply(tp, 5, HS2.Opcode.PushJpg));
-}
-function pushBlackFrame(tp) {
+
+    // Block until the panel acknowledges this frame (up to about 1.6 s), exactly as the
+    // shipped Universal Screen 88 plugin does; a late ring acknowledgement (0xFC) in the
+    // pipe is skipped by opcode. Nothing else paces the screen.
+    readReply(tp, 50, HS2.Opcode.PushJpg);
+}function pushBlackFrame(tp) {
     if (!blackJpeg) blackJpeg = HS2.hexToBytes(BLACK_JPEG_HEX);
 
     pushJpeg(tp, blackJpeg);
@@ -2732,32 +2689,16 @@ export function onringModeChanged() {
 export function Render() {
     if (!initialised) return;
 
+    // The shipped Lian Li plugins (Lian_Li_Universal_Screen_88.js, same DES protocol as this
+    // block; Lian_Li_Galahad_II_LCD.js, ring plus 480x480 panel) do no pacing of their own:
+    // every Render grabs the frame, writes it and blocks until the block acknowledges it. The
+    // acknowledgement is the flow control, and SignalRGB's frame rate target is the clock.
+    // 1.0.3 to 1.0.5 tried a frame clock, a skip-on-full hold and an adaptive rate on top of
+    // that; each one fought the block's own pacing and showed up as judder.
     const now = Date.now();
 
-    // The ring is serviced every tick. Its own cadence rules live in renderRing; gating it
-    // behind the screen's frame clock would tie ring latency to the JPEG rate for no reason.
     renderRing(transport, now);
 
-    // Frame pacing. SignalRGB drives Render as fast as the frame rate target allows, which
-    // is far more often than a 480x480 JPEG needs to be re-encoded and pushed.
-    const interval = Math.max(1, Math.floor(1000 / pacedFps()) - FRAME_INTERVAL_SLACK_MS);
-
-    if (now - lastFramePushedAt < interval) {
-        pause(1);
-
-        return;
-    }
-
-    if (now < screenHoldUntil) {
-        pause(1);
-
-        return;
-    }
-
-    lastFramePushedAt = now;
-
-    // Parameter changes are cheap and idempotent, so they ride along with the frame loop
-    // rather than needing a separate callback.
     applyBrightness(transport, false);
     applyRotation(transport, false);
 
@@ -2773,7 +2714,6 @@ export function Render() {
     pushJpeg(transport, jpeg);
     pause(1);
 }
-
 export function Shutdown(SystemSuspending) {
     if (!initialised) return;
 
