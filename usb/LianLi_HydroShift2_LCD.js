@@ -61,6 +61,12 @@ import udp from "@SignalRGB/udp";
 //
 // SPDX-License-Identifier: MIT
 
+// Inside an ES module on SignalRGB's Qt engine, globalThis, self, global and top-level this are
+// all undefined, so the embedded module below would have nowhere to install itself and every
+// HS2.* lookup would be a TypeError (the bare "Type error" SignalRGB logged for 1.0.0 to 1.0.2).
+// It installs itself on this module-scoped object instead.
+var HS2_ROOT = {};
+
 // ==== BEGIN EMBEDDED hs2-protocol.js ====
 // hs2-protocol.js
 //
@@ -91,10 +97,11 @@ import udp from "@SignalRGB/udp";
     } else if (root) {
         root.HS2 = api;                    // SignalRGB / any plain-script runtime
     }
-}(typeof globalThis !== "undefined" ? globalThis
-    : typeof self !== "undefined" ? self
-        : typeof global !== "undefined" ? global
-            : this, function () {
+}(typeof HS2_ROOT !== "undefined" && HS2_ROOT ? HS2_ROOT   // a host module that declares one
+    : typeof globalThis !== "undefined" ? globalThis
+        : typeof self !== "undefined" ? self
+            : typeof global !== "undefined" ? global
+                : this, function () {
     "use strict";
 
     // ---------------------------------------------------------------------------------
@@ -1452,7 +1459,8 @@ import udp from "@SignalRGB/udp";
  * packages such as "@SignalRGB/lcd" - so hs2-protocol.js is embedded verbatim rather than
  * imported. hs2-protocol.test.js fails if the copy above drifts from the tested original.
  */
-const HS2 = (typeof globalThis !== "undefined" && globalThis.HS2)
+const HS2 = HS2_ROOT.HS2
+    || (typeof globalThis !== "undefined" && globalThis.HS2)
     || (typeof self !== "undefined" && self.HS2)
     || (typeof global !== "undefined" && global.HS2);
 
@@ -1461,7 +1469,7 @@ const HS2 = (typeof globalThis !== "undefined" && globalThis.HS2)
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.2"; }
+export function Version() { return "1.0.3"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
