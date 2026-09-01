@@ -1,7 +1,8 @@
 import udp from "@SignalRGB/udp";
 
-// @SignalRGB/lcd is deliberately NOT imported here. See lcdModule() below: a
-// static import of it stops this plugin from ever producing a device.
+// @SignalRGB/lcd is NOT imported here, in either form. See lcdModule() below:
+// a static import kills the discovery engine and a dynamic one does not parse
+// at all. Both stop this plugin from ever producing a device.
 
 // ---------------------------------------------------------------------------
 // The block's RGB ring.
@@ -42,7 +43,7 @@ const RING_POSITIONS = buildRingPositions();
 const RING_NAMES = RING_POSITIONS.map(function(_, i) { return "Ring " + (i + 1); });
 
 export function Name() { return "Lian Li HydroShift II Bridge"; }
-export function Version() { return "0.2.0"; }
+export function Version() { return "0.2.1"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Magnet Group Labs"; }
 export function Size() { return [RING_GRID, RING_GRID]; }
@@ -379,32 +380,48 @@ function renderRing(now) {
 }
 
 // ---------------------------------------------------------------------------
-// @SignalRGB/lcd, resolved lazily.
+// @SignalRGB/lcd, and why this file never names it in an import.
 //
-// This one file is evaluated in two different JavaScript engines. The device
-// engine (Signal\Products\ThirdParty\Plugin\ThirdpartyJsPlugin.cpp) registers
-// bus, hid, lcd, udp and the rest. The discovery engine
-// (Signal\Discovery\DiscoveryService.cpp) registers a much smaller set -
-// DeviceDiscovery ("service"), appInfo, permissions, tcp, udp, performance,
-// base64 - and there is no lcd module in it.
+// One file, two of SignalRGB's JavaScript engines, and one parser behind both
+// of them (Qt's V4, out of Qt6Qml.dll). Neither form of import survives that.
 //
-// A static `import LCD from "@SignalRGB/lcd"` therefore fails to resolve when
-// the discovery thread instantiates the module, the whole module errors out
-// before DiscoveryService() can be read, and the plugin registers as a network
-// service that never ticks, never announces a controller and never produces a
-// device. That is exactly what happened on 2026-09-01: the log shows "Starting
-// discovery thread for ...LianLi_HydroShift2_Bridge.js" and then nothing. Every
-// shipped network plugin imports only modules the discovery engine also has
-// (WLED and Yeelight import @SignalRGB/udp, Twinkly @SignalRGB/base64,
-// Cololight/LeetDesk/SRGBmods-WLC nothing); @SignalRGB/lcd is imported only by
-// USB plugins such as NZXT_Kraken_Elite.js.
+// A dynamic import of @SignalRGB/lcd is a parse error. Qt's V4 grammar has
+// `import` as a declaration only; the dynamic-import *expression* is not in
+// it, so the file is rejected before a line of it runs and no guard around
+// the call can help. That is what the 2026-09-01 16:33 catalogue scan hit:
 //
-// So the module is fetched at runtime, on the device side only, and every
-// failure is swallowed: the ring, the heartbeat and the discovery service must
-// all keep working on an engine that has no LCD at all.
+//   Logs\SignalRGB_20260901_163257.log:524
+//   SignalRGB.PluginCrawler.WARNING - Failed to load plugin from file:
+//   LianLi_HydroShift2_Bridge.js:426 SyntaxError: Expected token `}'
+//
+// and line 528 of the same log then read "Network Services Found: 6", down from
+// 7, with discovery threads started for Cololight, Yeelight, WLED, leetdesk,
+// SRGBmods-WLC and Twinkly and none for us. Not one plugin shipped with
+// SignalRGB or installed as an add-on uses a dynamic import anywhere.
+//
+// A static `import LCD from "@SignalRGB/lcd"` parses, and fails later. The
+// discovery engine (Signal\Discovery\DiscoveryService.cpp) registers only
+// DeviceDiscovery, appInfo, permissions, tcp, udp, performance and base64 -
+// those names sit together in one block in SignalRgb.exe, with lcd, hid and bus
+// registered separately by the device engine
+// (Signal\Products\ThirdParty\Plugin\ThirdpartyJsPlugin.cpp). So the module
+// resolves on the device side and errors out on the discovery side, before
+// DiscoveryService() can be read. That was the 16:12 run in
+// Logs\SignalRGB_20260901_161247.old.1.log:523, which started a discovery
+// thread and then produced nothing. Every shipped network plugin imports only
+// modules both engines have (WLED and Yeelight @SignalRGB/udp, Twinkly
+// @SignalRGB/base64, Cololight/LeetDesk/SRGBmods-WLC nothing); @SignalRGB/lcd
+// is imported only by USB plugins such as NZXT_Kraken_Elite.js, which have no
+// discovery service at all.
+//
+// So the module is only ever taken from the host's own global scope, and every
+// path copes with not getting it: the ring, the heartbeat and the discovery
+// service all keep working on an engine that has no LCD, and the receiver falls
+// back to its own renderer for the screen.
+// ---------------------------------------------------------------------------
 let lcd = null;
-let lcdRequested = false;
 let lcdMissingLogged = false;
+let lcdUnavailableLogged = false;
 
 function lcdModule() {
 	if (lcd) { return lcd; }
@@ -417,21 +434,9 @@ function lcdModule() {
 		return lcd;
 	}
 
-	if (!lcdRequested) {
-		lcdRequested = true;
-
-		try {
-			// Not awaited: Initialize() and Render() both cope with a null lcd,
-			// and the first frame simply waits for the promise to land.
-			import("@SignalRGB/lcd").then(function(module) {
-				lcd = (module && module.default) ? module.default : module;
-				initializeLcd();
-			}).catch(function(err) {
-				log("Could not load @SignalRGB/lcd: " + err + ". The screen stays dark; the ring is unaffected.");
-			});
-		} catch (err) {
-			log("Could not load @SignalRGB/lcd: " + err + ". The screen stays dark; the ring is unaffected.");
-		}
+	if (!lcdUnavailableLogged) {
+		lcdUnavailableLogged = true;
+		log("This engine has no LCD module. The screen stays on the receiver's own renderer; the ring and the heartbeat are unaffected.");
 	}
 
 	return null;
