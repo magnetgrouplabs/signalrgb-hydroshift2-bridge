@@ -50,7 +50,7 @@ const RING_POSITIONS = buildRingPositions();
 const RING_NAMES = RING_POSITIONS.map(function(_, i) { return "Ring " + (i + 1); });
 
 export function Name() { return "Lian Li HydroShift II Bridge"; }
-export function Version() { return "0.3.2"; }
+export function Version() { return "0.3.3"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Magnet Group Labs"; }
 export function Size() { return [RING_GRID, RING_GRID]; }
@@ -325,7 +325,7 @@ function writeDatagram(datagram) {
 		return false;
 	}
 
-	socket.write(datagram, BRIDGE_HOST, currentPort());
+	lastWriteResult = socket.write(datagram, BRIDGE_HOST, currentPort());
 
 	return true;
 }
@@ -669,7 +669,34 @@ export function Initialize() {
 	// Announce ourselves straight away so the receiver stops its own renderer
 	// before the first frame lands, and hand it the brightness at the same time.
 	sendHeartbeat(Date.now(), true);
+
+	sendSizeProbes();
 }
+
+// Measures the udp module's datagram ceiling: one probe per size to the diagnostics
+// port, each starting with its own intended length, so the listener can compare what was
+// meant to leave with what arrived. Only 18 and 90 byte datagrams are proven to arrive;
+// the 8210-byte screen chunks have never been seen by the receiver. Diagnostics only.
+function sendSizeProbes() {
+	const sizes = [90, 1018, 1418, 2066, 4114, 8210, 16402];
+
+	for (let i = 0; i < sizes.length; i++) {
+		const probe = textBytes("HS2PROBE " + sizes[i] + " ");
+
+		while (probe.length < sizes[i]) { probe.push(0x41); }
+
+		try {
+			const result = socket.write(probe, BRIDGE_HOST, DIAG_PORT);
+
+			mirror("HS2LOG probe " + sizes[i] + " bytes: write returned " + result);
+		} catch (e) {
+			mirror("HS2LOG probe " + sizes[i] + " bytes threw " + e);
+		}
+	}
+}
+
+let writeResultLogged = false;
+let lastWriteResult = "n/a";
 
 export function Render() {
 	if (!socket) { return; }
@@ -736,6 +763,18 @@ function renderTick(now) {
 
 	diag.framesSent++;
 	diag.chunksSent += datagrams.length;
+
+	if (!writeResultLogged) {
+		writeResultLogged = true;
+		log("first frame: " + datagrams.length + " chunks, largest " + datagrams[0].length + " bytes, socket.write returned " + lastWriteResult);
+		mirrorRaw(datagrams[0]);
+	}
+}
+
+// Sends one real screen chunk to the diagnostics port as well, so its arrival (and its
+// length on arrival) can be compared with what the bridge port should be receiving.
+function mirrorRaw(datagram) {
+	try { socket.write(datagram, BRIDGE_HOST, DIAG_PORT); } catch (e) { /* diagnostics only */ }
 }
 
 export function Shutdown(suspend) {
