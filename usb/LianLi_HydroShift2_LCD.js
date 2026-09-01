@@ -555,28 +555,15 @@ var HS2_ROOT = {};
     // ---------------------------------------------------------------------------------
     // Bytes 4..7 of every frame. The firmware requires it to increase strictly, so the
     // source bumps by one whenever the clock has not moved: ts = raw > last ? raw : last + 1.
-    //
-    // CHANGED 2026-09-01: the origin is the Unix epoch, not this object's construction.
-    // Until the AIO was rebound to libusbK.sys only one process could hold it, and an
-    // origin of "whenever I started" was harmless. Now FanControl and SignalRGB write to
-    // the same OUT endpoint, and two counters both starting near zero interleave
-    // arbitrarily: whichever program launched second would hand the firmware timestamps
-    // far below the other's. Date.now() taken modulo 2^32 gives both writers the same
-    // origin, so their frames are ordered against each other by the wall clock. The C#
-    // side does the same thing in MonotonicTimestampSource; see docs/usb-sharing.md.
-    //
-    // The value wraps every 2^32 ms (about 49.7 days). That is a property of the
-    // protocol's 32 bit field, not of this choice of origin, and both writers wrap
-    // together because both count from the same place.
 
     function MonotonicTimestampSource() {
-        this._last = -1;
+        this._start = Date.now();
+        this._last = 0;
     }
 
     MonotonicTimestampSource.prototype.nextMs = function () {
-        var raw = Date.now() >>> 0;
-        var next = this._last < 0 ? raw
-            : (raw > this._last ? raw : (this._last + 1) >>> 0);
+        var raw = (Date.now() - this._start) >>> 0;
+        var next = raw > this._last ? raw : this._last + 1;
         this._last = next >>> 0;
         return this._last;
     };
@@ -1482,7 +1469,7 @@ const HS2 = HS2_ROOT.HS2
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.7"; }
+export function Version() { return "1.0.8"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -2314,7 +2301,7 @@ function pushJpeg(tp, jpegBytes) {
     // Block until the panel acknowledges this frame (up to about 1.6 s), exactly as the
     // shipped Universal Screen 88 plugin does; a late ring acknowledgement (0xFC) in the
     // pipe is skipped by opcode. Nothing else paces the screen.
-    const ack = readReply(tp, 50, HS2.Opcode.PushJpg);
+    const ack = readReply(tp, 10, HS2.Opcode.PushJpg);   // about 320 ms at most; a missing ack must not cost 1.5 s
     const t2 = Date.now();
 
     stat.frames++;
