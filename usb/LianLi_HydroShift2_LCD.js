@@ -1469,7 +1469,7 @@ const HS2 = HS2_ROOT.HS2
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.3"; }
+export function Version() { return "1.0.4"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -1644,9 +1644,9 @@ export function ControllableParameters() {
             description: "Static mode never pushes two ring frames closer together than this. Colour changes inside the gap are coalesced and the latest colours go out when it elapses.",
             type: "number",
             step: "50",
-            min: "100",
+            min: "34",
             max: "5000",
-            default: "500"
+            default: "100"
         },
         {
             property: "ringRefreshS",
@@ -1712,7 +1712,7 @@ const ENDPOINT_IN = 0x81;
 const REPLY_LENGTH = 512;
 const COMMAND_TIMEOUT_MS = 5000;
 const FRAME_TIMEOUT_MS = 1000;
-const ACK_TIMEOUT_MS = 100;
+const ACK_TIMEOUT_MS = 30;   // the block acks a push in about 7 ms; 100 ms stalled Render
 
 /** The drain: a short timeout, because a read that finds nothing is the answer we want. */
 const DRAIN_TIMEOUT_MS = 50;
@@ -1862,7 +1862,17 @@ const RING_FRAME_BYTES = RING_LED_COUNT * 3;   // 72
  * call sites and that is the shape proven on this hardware (ring-protocol.md). Batch mode
  * sends ringSampleMs instead, because there the interval is the playback rate.
  */
-const RING_STATIC_INTERVAL_MS = 100;
+// 20, not 100. ring characterize (2026-09-01) pushed single frames at 10 fps with a 20 ms
+// trailer and every push was acknowledged after about 50 ms of processing, while the earlier
+// 10 fps run with a 100 ms trailer showed only its first frame: the block ignores a new push
+// while it is still holding the previous frame for its declared interval.
+const RING_STATIC_INTERVAL_MS = 20;
+
+// Screen back-pressure without blocking: when a push ack reports the block's frame buffer
+// above the high-water mark, frames are skipped until this time instead of polling
+// QueryBlock in 50 ms steps inside Render (which froze both the screen and the ring).
+let screenHoldUntil = 0;
+const SCREEN_HOLD_MS = 40;
 
 function buildRingPositions() {
     const centre = (RING_GRID - 1) / 2;
@@ -1991,7 +2001,7 @@ function currentRingMode() {
 
 function currentRingMinGapMs() {
     return paramNumber(
-        typeof ringMinGapMs !== "undefined" ? ringMinGapMs : undefined, 500, 100, 5000);
+        typeof ringMinGapMs !== "undefined" ? ringMinGapMs : undefined, 100, 34, 5000);
 }
 
 function currentRingRefreshMs() {
@@ -2138,21 +2148,26 @@ function createUsbTransport(dev) {
  * The device answers every command with a 512-byte plaintext reply. The retry-with-pause
  * loop is copied from Lian_Li_Universal_Screen_88.js.
  */
-function readReply(tp, attempts) {
+function readReply(tp, attempts, expectedOpcode) {
     if (!tp || !currentReadAcks()) return null;
 
-    const tries = attempts || 20;
+    const tries = attempts || 5;
 
     for (let i = 0; i < tries; i++) {
         try {
             const reply = tp.read(REPLY_LENGTH, ACK_TIMEOUT_MS);
 
-            if (reply && reply.length > 0) return reply;
+            if (reply && reply.length > 0) {
+                // Replies echo their opcode in byte 0. A ring ack (0xFC) that arrives while a
+                // screen push is waiting is not the screen's ack: skip it and keep reading.
+                if (expectedOpcode !== undefined && (reply[0] & 0xFF) !== expectedOpcode) continue;
+
+                return reply;
+            }
         } catch (e) {
-            // Timeout or libusb error. Give the block a moment and try again.
         }
 
-        pause(10);
+        pause(2);
     }
 
     if (!ackFailureLogged) {
@@ -2163,7 +2178,6 @@ function readReply(tp, attempts) {
 
     return null;
 }
-
 /**
  * Back-pressure. PUMP-CONTROL.md section 7: if ack byte 8 is above 3, poll QueryBlock every
  * 50 ms until the block's frame buffer level falls to 2 or less.
@@ -2172,19 +2186,9 @@ function waitForBufferSpace(tp, ack) {
     if (!tp || !ack || ack.length < 9) return;
     if (HS2.readBufferLevel(ack) <= BUFFER_LEVEL_HIGH_WATER) return;
 
-    for (let i = 0; i < 20; i++) {
-        pause(50);
-        tp.write(HS2.commands.queryBlock(timestamps), COMMAND_TIMEOUT_MS);
-
-        const reply = readReply(tp, 5);
-
-        if (!reply) return;                       // acks unavailable; nothing to wait on
-        if (HS2.readBufferLevel(reply) <= BUFFER_LEVEL_LOW_WATER) return;
-    }
-
-    log("frame buffer stayed full; continuing anyway.");
+    // Non-blocking: skip the next few frames and let the block drain.
+    screenHoldUntil = Date.now() + SCREEN_HOLD_MS;
 }
-
 /**
  * Writes one stream out, honouring the push mode. See BENCH QUESTION 1 at pushJpeg: the
  * single write is what the shipped sibling plugin does and is the default; the chunked mode
@@ -2276,9 +2280,8 @@ function pushJpeg(tp, jpegBytes) {
     }
 
     writeStream(tp, HS2.buildJpgPushStream(timestamps, jpegBytes), FRAME_TIMEOUT_MS);
-    waitForBufferSpace(tp, readReply(tp));
+    waitForBufferSpace(tp, readReply(tp, 5, HS2.Opcode.PushJpg));
 }
-
 function pushBlackFrame(tp) {
     if (!blackJpeg) blackJpeg = HS2.hexToBytes(BLACK_JPEG_HEX);
 
@@ -2366,11 +2369,12 @@ function pushRing(tp, frames, intervalMs) {
     if (!tp || !ringApiAvailable() || !frames || frames.length === 0) return false;
 
     writeStream(tp, HS2.ring.pushStream(timestamps, frames, intervalMs), FRAME_TIMEOUT_MS);
-    waitForBufferSpace(tp, readReply(tp));
 
+    // Fire and forget. The block takes about 50 ms to acknowledge a ring push; waiting for it
+    // here stalled every screen frame in between. The ack is consumed and discarded by the
+    // next opcode-aware readReply on the screen path (or by the drain at the next open).
     return true;
 }
-
 function resetRingBatch() {
     ringBatch = [];
     ringLastSampleAt = 0;
@@ -2677,6 +2681,12 @@ export function Render() {
     const interval = Math.max(1, Math.floor(1000 / currentFps()) - FRAME_INTERVAL_SLACK_MS);
 
     if (now - lastFramePushedAt < interval) {
+        pause(1);
+
+        return;
+    }
+
+    if (now < screenHoldUntil) {
         pause(1);
 
         return;
