@@ -50,7 +50,7 @@ const RING_POSITIONS = buildRingPositions();
 const RING_NAMES = RING_POSITIONS.map(function(_, i) { return "Ring " + (i + 1); });
 
 export function Name() { return "Lian Li HydroShift II Bridge"; }
-export function Version() { return "0.3.0"; }
+export function Version() { return "0.3.1"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Magnet Group Labs"; }
 export function Size() { return [RING_GRID, RING_GRID]; }
@@ -73,7 +73,7 @@ ringReverse:readonly
 export function ControllableParameters() {
 	return [
 		{ property: "bridgePort", group: "settings", label: "Bridge UDP Port", type: "number", step: "1", min: "1024", max: "65535", default: "48211", live: false },
-		{ property: "targetFps", group: "settings", label: "Frames Per Second", type: "number", step: "1", min: "1", max: "15", default: "5" },
+		{ property: "targetFps", group: "settings", label: "Screen Frames Per Second", type: "number", step: "1", min: "1", max: "30", default: "15" },
 		{ property: "screenBrightness", group: "settings", label: "Screen Brightness", type: "number", step: "5", min: "0", max: "100", default: "100" },
 		{ property: "ringEnabled", group: "lighting", label: "Ring Lighting", type: "boolean", default: "true" },
 		{ property: "ringBrightness", group: "lighting", label: "Ring Brightness", type: "number", step: "5", min: "0", max: "100", default: "100" },
@@ -254,8 +254,13 @@ function currentPort() {
 	return isFinite(value) && value >= 1024 && value <= 65535 ? value : DEFAULT_PORT;
 }
 
+// Render() is asked for at RENDER_TICK_FPS regardless of the screen rate: the ring is
+// serviced on every tick and must not wait behind the screen's own clock, which
+// frameIntervalMs() enforces separately.
+const RENDER_TICK_FPS = 30;
+
 function currentFps() {
-	return clamp(Math.round(Number(typeof targetFps === "undefined" ? 5 : targetFps)), 1, 15);
+	return clamp(Math.round(Number(typeof targetFps === "undefined" ? 15 : targetFps)), 1, 30);
 }
 
 function currentBrightness() {
@@ -468,6 +473,57 @@ function initializeLcd() {
 	return true;
 }
 
+// What LCD.getFrame hands back is not documented. The shipped plugins only ever index
+// it byte by byte, which works for a plain Array, a Uint8Array and most array-likes,
+// but this file also slices it, concatenates it behind a header and reads its length,
+// which a typed array or an ArrayBuffer silently breaks (Array.prototype.concat glues a
+// typed array on as ONE element). So every frame is normalised to a plain Array of
+// unsigned bytes first, and the observed shape is logged once so the device console
+// shows what the engine actually returns.
+let frameShapeLogged = false;
+let qualityOptionRejected = false;
+
+function describeShape(value) {
+	const tag = Object.prototype.toString.call(value);
+	const len = value && typeof value.length === "number" ? value.length : "n/a";
+	const bytes = value && typeof value.byteLength === "number" ? value.byteLength : "n/a";
+
+	return tag + " length=" + len + " byteLength=" + bytes;
+}
+
+function normalizeFrame(frame) {
+	if (!frame) { return null; }
+
+	let view = frame;
+
+	if (typeof ArrayBuffer !== "undefined" && frame instanceof ArrayBuffer) {
+		view = new Uint8Array(frame);
+	} else if (typeof frame.length !== "number" && typeof frame.byteLength === "number" && frame.buffer) {
+		view = new Uint8Array(frame.buffer, frame.byteOffset || 0, frame.byteLength);
+	}
+
+	if (typeof view.length !== "number") { return null; }
+
+	const out = new Array(view.length);
+
+	for (let i = 0; i < view.length; i++) { out[i] = view[i] & 0xFF; }
+
+	return out;
+}
+
+function getFrameFromModule(module, quality) {
+	if (!qualityOptionRejected) {
+		try {
+			return module.getFrame({ format: "JPEG", quality: quality });
+		} catch (e) {
+			qualityOptionRejected = true;
+			log("LCD.getFrame rejected the quality option (" + e + "); using {format: JPEG} only from now on.");
+		}
+	}
+
+	return module.getFrame({ format: "JPEG" });
+}
+
 function grabFrame() {
 	const module = lcdModule();
 
@@ -483,10 +539,18 @@ function grabFrame() {
 	lcdMissingLogged = false;
 
 	for (let i = 0; i < QUALITY_LADDER.length; i++) {
-		const frame = module.getFrame({ format: "JPEG", quality: QUALITY_LADDER[i] });
+		const raw = getFrameFromModule(module, QUALITY_LADDER[i]);
+
+		if (!frameShapeLogged) {
+			frameShapeLogged = true;
+			log("LCD.getFrame returned " + describeShape(raw));
+		}
+
+		const frame = normalizeFrame(raw);
 
 		if (!frame || frame.length === 0) { return null; }
 		if (frame.length <= MAX_FRAME_BYTES) { return frame; }
+		if (qualityOptionRejected) { return null; } // no quality knob left to turn
 	}
 
 	return null;
@@ -523,9 +587,9 @@ export function Initialize() {
 	ringBlanked = false;
 	ringUnavailableLogged = false;
 
-	device.setFrameRateTarget(currentFps());
+	device.setFrameRateTarget(RENDER_TICK_FPS);
 
-	log("HydroShift II bridge sending to " + BRIDGE_HOST + ":" + currentPort() + " at " + currentFps() + " fps");
+	log("HydroShift II bridge sending to " + BRIDGE_HOST + ":" + currentPort() + ", screen at " + currentFps() + " fps, ring serviced at " + RENDER_TICK_FPS + " Hz");
 
 	// Announce ourselves straight away so the receiver stops its own renderer
 	// before the first frame lands, and hand it the brightness at the same time.
@@ -601,7 +665,7 @@ export function onbridgePortChanged() {
 export function ontargetFpsChanged() {
 	if (!socket) { return; }
 
-	device.setFrameRateTarget(currentFps());
+	// The render tick stays at RENDER_TICK_FPS; only the screen's own clock changes.
 	lastFrameAt = 0;
 }
 
