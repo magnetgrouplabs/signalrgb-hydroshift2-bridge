@@ -1482,7 +1482,7 @@ const HS2 = HS2_ROOT.HS2
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.6"; }
+export function Version() { return "1.0.7"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -2073,6 +2073,24 @@ function log(message) {
 
 // Runs one Initialize step, naming it before and naming it again if it throws, so a bare
 // "TypeError: Type error" from a native call (all SignalRGB's log shows) can be placed.
+// Two-second statistics over the diagnostics port: what the loop actually achieves.
+const stat = { renders: 0, frames: 0, grabMs: 0, writeMs: 0, ackMs: 0, ackMax: 0, noAck: 0, skipped: 0, levelMax: 0, levels: "", ringPushes: 0, ringReads: 0 };
+let statSince = 0;
+
+function emitStats(now) {
+    if (statSince === 0) { statSince = now; return; }
+    if (now - statSince < 2000) return;
+
+    const f = stat.frames || 1;
+    const secs = (now - statSince) / 1000;
+    mirror("HS2STAT v" + Version() + " fps=" + (stat.frames / secs).toFixed(1) + " renders/s=" + (stat.renders / secs).toFixed(1)
+        + " grab=" + (stat.grabMs / f).toFixed(1) + "ms write=" + (stat.writeMs / f).toFixed(1) + "ms ack=" + (stat.ackMs / f).toFixed(1)
+        + "ms ackMax=" + stat.ackMax + "ms noAck=" + stat.noAck + " skipped0xFC=" + stat.skipped + " levelMax=" + stat.levelMax
+        + " levels=" + stat.levels + " ring=" + stat.ringPushes);
+    for (const k in stat) stat[k] = typeof stat[k] === "number" ? 0 : "";
+    statSince = now;
+}
+
 function step(name, action) {
     mirror("HS2LCD init: " + name);
     try {
@@ -2176,7 +2194,7 @@ function readReply(tp, attempts, expectedOpcode) {
             if (reply && reply.length > 0) {
                 // Replies echo their opcode in byte 0. A ring ack (0xFC) that arrives while a
                 // screen push is waiting is not the screen's ack: skip it and keep reading.
-                if (expectedOpcode !== undefined && (reply[0] & 0xFF) !== expectedOpcode) continue;
+                if (expectedOpcode !== undefined && (reply[0] & 0xFF) !== expectedOpcode) { stat.skipped++; continue; }
 
                 return reply;
             }
@@ -2185,6 +2203,8 @@ function readReply(tp, attempts, expectedOpcode) {
 
         pause(2);
     }
+
+    stat.noAck++;
 
     if (!ackFailureLogged) {
         log("no reply on the IN endpoint after " + tries
@@ -2285,13 +2305,32 @@ function pushJpeg(tp, jpegBytes) {
         return;
     }
 
+    const t0 = Date.now();
+
     writeStream(tp, HS2.buildJpgPushStream(timestamps, jpegBytes), FRAME_TIMEOUT_MS);
+
+    const t1 = Date.now();
 
     // Block until the panel acknowledges this frame (up to about 1.6 s), exactly as the
     // shipped Universal Screen 88 plugin does; a late ring acknowledgement (0xFC) in the
     // pipe is skipped by opcode. Nothing else paces the screen.
-    readReply(tp, 50, HS2.Opcode.PushJpg);
-}function pushBlackFrame(tp) {
+    const ack = readReply(tp, 50, HS2.Opcode.PushJpg);
+    const t2 = Date.now();
+
+    stat.frames++;
+    stat.writeMs += t1 - t0;
+    stat.ackMs += t2 - t1;
+    if (t2 - t1 > stat.ackMax) stat.ackMax = t2 - t1;
+
+    if (ack && ack.length > 8) {
+        const level = HS2.readBufferLevel(ack);
+
+        if (level > stat.levelMax) stat.levelMax = level;
+        if (stat.levels.length < 40) stat.levels += level;
+    }
+}
+
+function pushBlackFrame(tp) {
     if (!blackJpeg) blackJpeg = HS2.hexToBytes(BLACK_JPEG_HEX);
 
     pushJpeg(tp, blackJpeg);
@@ -2382,6 +2421,7 @@ function pushRing(tp, frames, intervalMs) {
     if (!tp || !ringApiAvailable() || !frames || frames.length === 0) return false;
 
     writeStream(tp, HS2.ring.pushStream(timestamps, frames, intervalMs), FRAME_TIMEOUT_MS);
+    stat.ringPushes++;
 
     if (currentRingWaitForAck()) {
         readReply(tp, 5, HS2.Opcode.PushRgbData);
@@ -2697,12 +2737,17 @@ export function Render() {
     // that; each one fought the block's own pacing and showed up as judder.
     const now = Date.now();
 
+    stat.renders++;
+    emitStats(now);
     renderRing(transport, now);
 
     applyBrightness(transport, false);
     applyRotation(transport, false);
 
+    const g0 = Date.now();
     const jpeg = grabJpegFrame();
+
+    stat.grabMs += Date.now() - g0;
 
     if (!jpeg || jpeg.length === 0) {
         log("canvas grab returned nothing; skipping this frame.");
