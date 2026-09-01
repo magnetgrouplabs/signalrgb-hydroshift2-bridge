@@ -1,8 +1,15 @@
 import udp from "@SignalRGB/udp";
+import LCD from "@SignalRGB/lcd";
 
-// @SignalRGB/lcd is NOT imported here, in either form. See lcdModule() below:
-// a static import kills the discovery engine and a dynamic one does not parse
-// at all. Both stop this plugin from ever producing a device.
+// @SignalRGB/lcd IS imported statically, on purpose (0.3.0, the module-shim test).
+// Qt 6.8.1 resolves an import in two steps (qv4engine.cpp, ExecutionEngine::loadModule):
+// first the native modules registered by SignalRGB under the raw specifier, then, if none
+// matches, a file resolved against this file's own folder. The device engine registers
+// "@SignalRGB/lcd" natively, so it links the real module and the LCD tab exists. The
+// discovery engine registers no lcd module, so the same specifier falls through to the
+// stub file shipped next to this plugin at ./@SignalRGB/lcd, the link succeeds, and
+// DiscoveryService() runs. The stub is never called: only the device engine reaches
+// Initialize() and Render(). lcdModule() below tells the two apart.
 
 // ---------------------------------------------------------------------------
 // The block's RGB ring.
@@ -43,7 +50,7 @@ const RING_POSITIONS = buildRingPositions();
 const RING_NAMES = RING_POSITIONS.map(function(_, i) { return "Ring " + (i + 1); });
 
 export function Name() { return "Lian Li HydroShift II Bridge"; }
-export function Version() { return "0.2.1"; }
+export function Version() { return "0.3.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "Magnet Group Labs"; }
 export function Size() { return [RING_GRID, RING_GRID]; }
@@ -426,12 +433,21 @@ let lcdUnavailableLogged = false;
 function lcdModule() {
 	if (lcd) { return lcd; }
 
-	// A host that hands the module over as a global needs nothing else. This is
-	// also the seam the offline suite drives.
-	if (typeof LCD !== "undefined" && LCD && typeof LCD.getFrame === "function") {
+	// The statically imported module. In the device engine this is SignalRGB's native
+	// lcd module; in the discovery engine it is the stub at ./@SignalRGB/lcd, which
+	// marks itself with isShim and must never be used for frames.
+	if (typeof LCD !== "undefined" && LCD && !LCD.isShim && typeof LCD.getFrame === "function") {
 		lcd = LCD;
+		log("lcd module linked: native (LCD tab expected)");
 
 		return lcd;
+	}
+
+	if (typeof LCD !== "undefined" && LCD && LCD.isShim && !lcdUnavailableLogged) {
+		lcdUnavailableLogged = true;
+		log("lcd module linked: SHIM. This engine has no native lcd module; no LCD tab from here.");
+
+		return null;
 	}
 
 	if (!lcdUnavailableLogged) {
