@@ -1461,7 +1461,7 @@ const HS2 = (typeof globalThis !== "undefined" && globalThis.HS2)
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.1"; }
+export function Version() { return "1.0.2"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -2047,7 +2047,6 @@ function step(name, action) {
         log("init FAILED at " + name + ": " + e);
         throw e;
     }
-}
 }
 
 function pause(ms) {
