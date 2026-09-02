@@ -1469,7 +1469,7 @@ const HS2 = HS2_ROOT.HS2
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.8"; }
+export function Version() { return "1.0.9"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -2061,7 +2061,7 @@ function log(message) {
 // Runs one Initialize step, naming it before and naming it again if it throws, so a bare
 // "TypeError: Type error" from a native call (all SignalRGB's log shows) can be placed.
 // Two-second statistics over the diagnostics port: what the loop actually achieves.
-const stat = { renders: 0, frames: 0, grabMs: 0, writeMs: 0, ackMs: 0, ackMax: 0, noAck: 0, skipped: 0, levelMax: 0, levels: "", ringPushes: 0, ringReads: 0 };
+const stat = { renders: 0, frames: 0, grabMs: 0, buildMs: 0, writeMs: 0, ackMs: 0, ackMax: 0, noAck: 0, skipped: 0, levelMax: 0, levels: "", ringPushes: 0, ringReads: 0 };
 let statSince = 0;
 
 function emitStats(now) {
@@ -2071,7 +2071,7 @@ function emitStats(now) {
     const f = stat.frames || 1;
     const secs = (now - statSince) / 1000;
     mirror("HS2STAT v" + Version() + " fps=" + (stat.frames / secs).toFixed(1) + " renders/s=" + (stat.renders / secs).toFixed(1)
-        + " grab=" + (stat.grabMs / f).toFixed(1) + "ms write=" + (stat.writeMs / f).toFixed(1) + "ms ack=" + (stat.ackMs / f).toFixed(1)
+        + " grab=" + (stat.grabMs / f).toFixed(1) + "ms build=" + (stat.buildMs / f).toFixed(1) + "ms write=" + (stat.writeMs / f).toFixed(1) + "ms ack=" + (stat.ackMs / f).toFixed(1)
         + "ms ackMax=" + stat.ackMax + "ms noAck=" + stat.noAck + " skipped0xFC=" + stat.skipped + " levelMax=" + stat.levelMax
         + " levels=" + stat.levels + " ring=" + stat.ringPushes);
     for (const k in stat) stat[k] = typeof stat[k] === "number" ? 0 : "";
@@ -2282,6 +2282,54 @@ function grabJpegFrame() {
  * stream cut into <=1016-byte pieces across several calls. That is what "Chunked 1016"
  * exercises. Do not assume either mode works until a frame has visibly landed on the panel.
  */
+function hex4(bytes) {
+    let out = "";
+
+    for (let i = 0; i < 4 && i < bytes.length; i++) {
+        const v = (bytes[i] & 0xFF).toString(16);
+
+        out += (v.length < 2 ? "0" : "") + v + " ";
+    }
+
+    return out.trim();
+}
+
+let screenAckLogged = false;
+
+// The block's answer to a PushJpg. 1.0.4 to 1.0.8 demanded byte 0 == 0x65 and never saw it
+// (measured: one reply per frame, byte 0 something else, then a 200 ms timeout on every
+// frame, 2.5 fps). What SignalRGB's bulk read hands back for that reply is logged once here;
+// until that is known, anything that is not a late ring acknowledgement is the frame's ack.
+function readScreenAck(tp) {
+    if (!tp || !currentReadAcks()) return null;
+
+    for (let i = 0; i < 10; i++) {
+        let reply = null;
+
+        try {
+            reply = tp.read(REPLY_LENGTH, ACK_TIMEOUT_MS);
+        } catch (e) {
+        }
+
+        if (reply && reply.length > 0) {
+            if ((reply[0] & 0xFF) === HS2.Opcode.PushRgbData) { stat.skipped++; continue; }
+
+            if (!screenAckLogged) {
+                screenAckLogged = true;
+                log("first screen ack: " + reply.length + " bytes, head " + hex4(reply));
+            }
+
+            return reply;
+        }
+
+        pause(2);
+    }
+
+    stat.noAck++;
+
+    return null;
+}
+
 function pushJpeg(tp, jpegBytes) {
     if (!tp || !jpegBytes || jpegBytes.length === 0) return;
 
@@ -2293,21 +2341,20 @@ function pushJpeg(tp, jpegBytes) {
     }
 
     const t0 = Date.now();
-
-    writeStream(tp, HS2.buildJpgPushStream(timestamps, jpegBytes), FRAME_TIMEOUT_MS);
-
+    const stream = HS2.buildJpgPushStream(timestamps, jpegBytes);
     const t1 = Date.now();
 
-    // Block until the panel acknowledges this frame (up to about 1.6 s), exactly as the
-    // shipped Universal Screen 88 plugin does; a late ring acknowledgement (0xFC) in the
-    // pipe is skipped by opcode. Nothing else paces the screen.
-    const ack = readReply(tp, 10, HS2.Opcode.PushJpg);   // about 320 ms at most; a missing ack must not cost 1.5 s
+    writeStream(tp, stream, FRAME_TIMEOUT_MS);
+
     const t2 = Date.now();
+    const ack = readScreenAck(tp);
+    const t3 = Date.now();
 
     stat.frames++;
-    stat.writeMs += t1 - t0;
-    stat.ackMs += t2 - t1;
-    if (t2 - t1 > stat.ackMax) stat.ackMax = t2 - t1;
+    stat.buildMs += t1 - t0;
+    stat.writeMs += t2 - t1;
+    stat.ackMs += t3 - t2;
+    if (t3 - t2 > stat.ackMax) stat.ackMax = t3 - t2;
 
     if (ack && ack.length > 8) {
         const level = HS2.readBufferLevel(ack);
@@ -2316,7 +2363,6 @@ function pushJpeg(tp, jpegBytes) {
         if (stat.levels.length < 40) stat.levels += level;
     }
 }
-
 function pushBlackFrame(tp) {
     if (!blackJpeg) blackJpeg = HS2.hexToBytes(BLACK_JPEG_HEX);
 
