@@ -1469,7 +1469,7 @@ const HS2 = HS2_ROOT.HS2
 // ---------------------------------------------------------------------------------------
 
 export function Name() { return "Lian Li HydroShift II LCD-S 360"; }
-export function Version() { return "1.0.9"; }
+export function Version() { return "1.1.0"; }
 export function VendorId() { return 0x1CBE; }
 export function ProductId() { return 0xA034; }
 export function Publisher() { return "Magnet Group Labs"; }
@@ -1724,8 +1724,8 @@ const FRAME_TIMEOUT_MS = 1000;
 const ACK_TIMEOUT_MS = 30;   // the block acks a push in about 7 ms; 100 ms stalled Render
 
 /** The drain: a short timeout, because a read that finds nothing is the answer we want. */
-const DRAIN_TIMEOUT_MS = 50;
-const DRAIN_MAX_READS = 32;
+const DRAIN_TIMEOUT_MS = 10;   // reads never come back empty here, so the drain is a short fixed burst
+const DRAIN_MAX_READS = 4;
 
 /** The clock display mode the HydroShift II init sequence uses (PUMP-CONTROL.md, s7). */
 const CLOCK_MODE = 2;
@@ -2210,15 +2210,15 @@ function readReply(tp, attempts, expectedOpcode) {
 function writeStream(tp, stream, timeoutMs) {
     if (currentPushMode() === "Chunked 1016" && stream.length > CHUNK_SIZE) {
         const chunks = HS2.chunkStream(stream, CHUNK_SIZE);
+        let last;
 
-        for (let i = 0; i < chunks.length; i++) tp.write(chunks[i], timeoutMs);
+        for (let i = 0; i < chunks.length; i++) last = tp.write(chunks[i], timeoutMs);
 
-        return;
+        return last;
     }
 
-    tp.write(stream, timeoutMs);
+    return tp.write(stream, timeoutMs);
 }
-
 /** Sends a 512-byte command frame and drains its reply. */
 function sendCommand(tp, frame) {
     tp.write(frame, COMMAND_TIMEOUT_MS);
@@ -2300,35 +2300,29 @@ let screenAckLogged = false;
 // (measured: one reply per frame, byte 0 something else, then a 200 ms timeout on every
 // frame, 2.5 fps). What SignalRGB's bulk read hands back for that reply is logged once here;
 // until that is known, anything that is not a late ring acknowledgement is the frame's ack.
-function readScreenAck(tp) {
-    if (!tp || !currentReadAcks()) return null;
+let readShapeLogged = 0;
 
-    for (let i = 0; i < 10; i++) {
-        let reply = null;
+// One short read after each frame so the block's reply queue never fills. Measured on
+// 2026-09-01 (1.0.9): what SignalRGB's bulk read returns is a 512-byte array of zeros for
+// every reply, and a drain of 32 reads never came back empty, so the content and the
+// arrival of replies cannot be observed from here. Reads are therefore never waited on;
+// the blocking bulk write (38 to 156 ms when the block is busy) is the flow control, which
+// is also how the shipped Universal Screen 88 plugin ends up behaving.
+function drainOneReply(tp) {
+    if (!tp || !currentReadAcks()) return;
 
-        try {
-            reply = tp.read(REPLY_LENGTH, ACK_TIMEOUT_MS);
-        } catch (e) {
+    try {
+        const r = tp.read(REPLY_LENGTH, 1);
+
+        if (readShapeLogged < 3) {
+            readShapeLogged++;
+            log("read returned " + (r === undefined ? "undefined" : r === null ? "null" : (typeof r) + " len=" + (r && r.length) + " head=" + (r && r.length ? hex4(r) : "-")));
         }
-
-        if (reply && reply.length > 0) {
-            if ((reply[0] & 0xFF) === HS2.Opcode.PushRgbData) { stat.skipped++; continue; }
-
-            if (!screenAckLogged) {
-                screenAckLogged = true;
-                log("first screen ack: " + reply.length + " bytes, head " + hex4(reply));
-            }
-
-            return reply;
-        }
-
-        pause(2);
+    } catch (e) {
+        if (readShapeLogged < 3) { readShapeLogged++; log("read threw: " + e); }
     }
-
-    stat.noAck++;
-
-    return null;
 }
+let writeReturnLogged = false;
 
 function pushJpeg(tp, jpegBytes) {
     if (!tp || !jpegBytes || jpegBytes.length === 0) return;
@@ -2344,10 +2338,17 @@ function pushJpeg(tp, jpegBytes) {
     const stream = HS2.buildJpgPushStream(timestamps, jpegBytes);
     const t1 = Date.now();
 
-    writeStream(tp, stream, FRAME_TIMEOUT_MS);
+    const written = writeStream(tp, stream, FRAME_TIMEOUT_MS);
+
+    if (!writeReturnLogged) {
+        writeReturnLogged = true;
+        log("first frame write of " + stream.length + " bytes returned " + written);
+    }
 
     const t2 = Date.now();
-    const ack = readScreenAck(tp);
+
+    drainOneReply(tp);
+
     const t3 = Date.now();
 
     stat.frames++;
@@ -2355,15 +2356,7 @@ function pushJpeg(tp, jpegBytes) {
     stat.writeMs += t2 - t1;
     stat.ackMs += t3 - t2;
     if (t3 - t2 > stat.ackMax) stat.ackMax = t3 - t2;
-
-    if (ack && ack.length > 8) {
-        const level = HS2.readBufferLevel(ack);
-
-        if (level > stat.levelMax) stat.levelMax = level;
-        if (stat.levels.length < 40) stat.levels += level;
-    }
-}
-function pushBlackFrame(tp) {
+}function pushBlackFrame(tp) {
     if (!blackJpeg) blackJpeg = HS2.hexToBytes(BLACK_JPEG_HEX);
 
     pushJpeg(tp, blackJpeg);
